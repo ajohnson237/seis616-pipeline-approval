@@ -1,0 +1,18 @@
+version: 0.0
+os: linux
+files:
+  - source: /
+    destination: /opt/python-app
+hooks:
+  AfterInstall:
+    - location: scripts/install_dependencies.sh
+      timeout: 180
+      runas: root
+  ApplicationStart:
+    - location: scripts/start_server.sh
+      timeout: 90
+      runas: root
+  ApplicationStop:
+    - location: scripts/stop_server.sh
+      timeout: 90
+      runas: root

@@ -1,0 +1,36 @@
+//Variables
+@body-color:  #444;
+@header-background: #DFB887;
+@home-background: #E6E6FA;
+
+body {
+  margin: 0;
+  padding: 0;
+  font-family: "Helvetica Neue", Helvetica, Arial, sans-serif;
+  color: @body-color;
+}
+/*
+ * Formatting the header area
+ */
+header {
+  background-color: @header-background;
+  height: 35px;
+  width: 100%;
+  opacity: .9;
+  margin-bottom: 10px;
+}
+
+/*
+ * Centering the body content
+ */
+.container {
+  width: 1200px;
+  margin: 0 auto;
+}
+div.home {
+  padding: 10px 0 30px 20px;
+  background-color: @home-background;
+  -webkit-border-radius: 6px;
+     -moz-border-radius: 6px;
+          border-radius: 6px;
+}

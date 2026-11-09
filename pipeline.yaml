@@ -1,0 +1,559 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  SEIS 616 - Software delivery pipeline from class (GitHub -> CodeBuild -> CodeDeploy to an
+  Auto Scaling group behind an ALB), extended with a manual Review stage. After code is checked in,
+  the pipeline pauses at Review and the maintainer is notified by SNS email. The pipeline resumes
+  only after the change is approved.
+
+Parameters:
+
+  GitHubUsername:
+    Description: "Your GitHub username or organization name"
+    Type: "String"
+
+  GitHubRepositoryName:
+    Description: "GitHub repository name"
+    Type: "String"
+
+  GitHubBranchName:
+    Description: "GitHub branch name"
+    Type: "String"
+    Default: "main"
+
+  ApprovalEmail:
+    Description: "Email address of the maintainer who reviews and approves changes"
+    Type: "String"
+    AllowedPattern: "^[^@\\s]+@[^@\\s]+\\.[^@\\s]+$"
+    ConstraintDescription: "Must be a valid email address"
+
+  webami:
+    Description: "Web server AMI (latest Ubuntu 22.04 LTS, looked up from SSM)"
+    Type: "AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>"
+    Default: "/aws/service/canonical/ubuntu/server/22.04/stable/current/amd64/hvm/ebs-gp2/ami-id"
+
+  webtype:
+    Description: "Web server instance type"
+    Type: "String"
+    Default: "t3.micro"
+
+  asgsize:
+    Description: "ASG size."
+    Type: "String"
+    Default: "2"
+
+Resources:
+
+  # ---------------------------------------------------------------------------
+  # Artifact store
+  # ---------------------------------------------------------------------------
+  ArtifactBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: "AES256"
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  # ---------------------------------------------------------------------------
+  # Network: VPC with two public subnets
+  # ---------------------------------------------------------------------------
+  Vpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      CidrBlock: "10.0.0.0/16"
+      Tags:
+        - Key: "Environment"
+          Value: "Test"
+
+  PublicSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: "10.0.0.0/24"
+      MapPublicIpOnLaunch: true
+      AvailabilityZone: !Select [0, !GetAZs ""]
+
+  PublicSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: "10.0.1.0/24"
+      MapPublicIpOnLaunch: true
+      AvailabilityZone: !Select [1, !GetAZs ""]
+
+  InternetGW:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: stack
+          Value: !Ref "AWS::StackName"
+
+  GatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      InternetGatewayId: !Ref InternetGW
+      VpcId: !Ref Vpc
+
+  PublicRT:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: GatewayAttachment
+    Properties:
+      DestinationCidrBlock: "0.0.0.0/0"
+      RouteTableId: !Ref PublicRT
+      GatewayId: !Ref InternetGW
+
+  PublicSubnet1RTAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PublicRT
+      SubnetId: !Ref PublicSubnet1
+
+  PublicSubnet2RTAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PublicRT
+      SubnetId: !Ref PublicSubnet2
+
+  ElbSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      VpcId: !Ref Vpc
+      GroupDescription: "Allow http access from everywhere"
+      SecurityGroupIngress:
+        - IpProtocol: "tcp"
+          FromPort: 80
+          ToPort: 80
+          CidrIp: "0.0.0.0/0"
+
+  WebserverSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      VpcId: !Ref Vpc
+      GroupDescription: "Allow port 80 from ELB"
+      SecurityGroupIngress:
+        - IpProtocol: "tcp"
+          FromPort: 80
+          ToPort: 80
+          SourceSecurityGroupId: !GetAtt ElbSG.GroupId
+
+  # ---------------------------------------------------------------------------
+  # Production environment: ALB + Auto Scaling group of web servers
+  # ---------------------------------------------------------------------------
+  ELB:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    DependsOn: GatewayAttachment
+    Properties:
+      LoadBalancerAttributes:
+        - Key: "idle_timeout.timeout_seconds"
+          Value: "30"
+      Name: !Sub "${AWS::StackName}-alb"
+      Scheme: "internet-facing"
+      SecurityGroups:
+        - !Ref ElbSG
+      Subnets:
+        - !Ref PublicSubnet1
+        - !Ref PublicSubnet2
+
+  ELBListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      DefaultActions:
+        - TargetGroupArn: !Ref ELBTargetGroup
+          Type: "forward"
+      LoadBalancerArn: !Ref ELB
+      Port: 80
+      Protocol: "HTTP"
+
+  ELBTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      HealthCheckPath: "/health"
+      HealthCheckProtocol: "HTTP"
+      HealthCheckIntervalSeconds: 10
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 2
+      TargetType: "instance"
+      Port: 80
+      Protocol: "HTTP"
+      VpcId: !Ref Vpc
+      TargetGroupAttributes:
+        # Speeds up CodeDeploy's deregister/re-register cycle (default is 300 seconds)
+        - Key: "deregistration_delay.timeout_seconds"
+          Value: "30"
+
+  WebInstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - "ec2.amazonaws.com"
+            Action:
+              - "sts:AssumeRole"
+      Path: "/"
+      ManagedPolicyArns:
+        - "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
+      Policies:
+        - PolicyName: "ec2codedeploy"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: "Allow"
+                Resource:
+                  - !GetAtt ArtifactBucket.Arn
+                  - !Sub "${ArtifactBucket.Arn}/*"
+                Action:
+                  - "s3:GetObject"
+                  - "s3:GetObjectVersion"
+                  - "s3:ListBucket"
+                  - "s3:GetBucketLocation"
+
+  WebInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref WebInstanceRole
+
+  WebLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateData:
+        ImageId: !Ref webami
+        InstanceType: !Ref webtype
+        IamInstanceProfile:
+          Arn: !GetAtt WebInstanceProfile.Arn
+        SecurityGroupIds:
+          - !Ref WebserverSG
+        TagSpecifications:
+          - ResourceType: instance
+            Tags:
+              - Key: "Name"
+                Value: "webapp"
+              - Key: "Role"
+                Value: "webserver"
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash
+            apt-get update -y
+            apt-get install -y ruby-full wget
+            cd /home/ubuntu
+            wget https://aws-codedeploy-${AWS::Region}.s3.${AWS::Region}.amazonaws.com/latest/install
+            chmod +x ./install
+            ./install auto
+            systemctl enable --now codedeploy-agent
+            rm install
+
+  WebGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    DependsOn: PublicRoute
+    Properties:
+      DesiredCapacity: !Ref asgsize
+      MaxSize: !Ref asgsize
+      MinSize: !Ref asgsize
+      LaunchTemplate:
+        LaunchTemplateId: !Ref WebLaunchTemplate
+        Version: !GetAtt WebLaunchTemplate.LatestVersionNumber
+      TargetGroupARNs:
+        - !Ref ELBTargetGroup
+      VPCZoneIdentifier:
+        - !Ref PublicSubnet1
+        - !Ref PublicSubnet2
+
+  # ---------------------------------------------------------------------------
+  # Build: CodeBuild
+  # ---------------------------------------------------------------------------
+  AppBuildProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub "${AWS::StackName}-build"
+      Description: "pipeline build project"
+      Artifacts:
+        Type: "CODEPIPELINE"
+      Environment:
+        ComputeType: "BUILD_GENERAL1_SMALL"
+        Image: "aws/codebuild/standard:7.0"
+        ImagePullCredentialsType: "CODEBUILD"
+        Type: "LINUX_CONTAINER"
+      ServiceRole: !GetAtt AppBuildRole.Arn
+      Source:
+        Type: "CODEPIPELINE"
+
+  AppBuildRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Principal:
+              Service:
+                - "codebuild.amazonaws.com"
+            Action:
+              - "sts:AssumeRole"
+      Path: "/"
+      Policies:
+        - PolicyName: "CodeBuildAccess"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: "Allow"
+                Resource:
+                  - !GetAtt ArtifactBucket.Arn
+                  - !Sub "${ArtifactBucket.Arn}/*"
+                Action:
+                  - "s3:GetObject"
+                  - "s3:GetObjectVersion"
+                  - "s3:PutObject"
+                  - "s3:GetBucketAcl"
+                  - "s3:GetBucketLocation"
+              - Effect: "Allow"
+                Resource:
+                  - !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/codebuild/${AWS::StackName}-build"
+                  - !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/codebuild/${AWS::StackName}-build:*"
+                Action:
+                  - "logs:CreateLogGroup"
+                  - "logs:CreateLogStream"
+                  - "logs:PutLogEvents"
+
+  # ---------------------------------------------------------------------------
+  # Deploy: CodeDeploy
+  # ---------------------------------------------------------------------------
+  WebPlatformApplication:
+    Type: AWS::CodeDeploy::Application
+    Properties:
+      ComputePlatform: "Server"
+
+  WebPlatformDeploymentGroup:
+    Type: AWS::CodeDeploy::DeploymentGroup
+    Properties:
+      ApplicationName: !Ref WebPlatformApplication
+      AutoScalingGroups:
+        - !Ref WebGroup
+      DeploymentConfigName: "CodeDeployDefault.OneAtATime"
+      DeploymentStyle:
+        DeploymentOption: "WITH_TRAFFIC_CONTROL"
+        DeploymentType: "IN_PLACE"
+      LoadBalancerInfo:
+        TargetGroupInfoList:
+          - Name: !GetAtt ELBTargetGroup.TargetGroupName
+      ServiceRoleArn: !GetAtt CodeDeployServiceRole.Arn
+
+  CodeDeployServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Action:
+              - "sts:AssumeRole"
+            Effect: "Allow"
+            Principal:
+              Service:
+                - "codedeploy.amazonaws.com"
+      ManagedPolicyArns:
+        - "arn:aws:iam::aws:policy/service-role/AWSCodeDeployRole"
+      Policies:
+        # Extra permissions CodeDeploy needs when the ASG uses a launch template
+        - PolicyName: "launch-template-access"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: "Allow"
+                Action:
+                  - "ec2:RunInstances"
+                  - "ec2:CreateTags"
+                Resource: "*"
+              - Effect: "Allow"
+                Action: "iam:PassRole"
+                Resource: !GetAtt WebInstanceRole.Arn
+
+  # ---------------------------------------------------------------------------
+  # Source: GitHub connection (replaces the class's personal-access-token action)
+  # Created in PENDING state; activate it once in the console.
+  # ---------------------------------------------------------------------------
+  GitHubConnection:
+    Type: AWS::CodeStarConnections::Connection
+    Properties:
+      ConnectionName: !Sub "${AWS::StackName}-gh"
+      ProviderType: "GitHub"
+
+  # ---------------------------------------------------------------------------
+  # NEW: Manual review notification
+  # ---------------------------------------------------------------------------
+  ApprovalTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub "${AWS::StackName}-approval"
+      DisplayName: "Pipeline Review"
+      Subscription:
+        - Protocol: "email"
+          Endpoint: !Ref ApprovalEmail
+
+  # ---------------------------------------------------------------------------
+  # Pipeline: Source -> Review (NEW) -> Build -> Deploy
+  # ---------------------------------------------------------------------------
+  AppCodePipeline:
+    Type: AWS::CodePipeline::Pipeline
+    Properties:
+      Name: !Sub "${AWS::StackName}-pipeline"
+      PipelineType: "V2"
+      ArtifactStore:
+        Location: !Ref ArtifactBucket
+        Type: "S3"
+      RoleArn: !GetAtt CodePipelineServiceRole.Arn
+      Stages:
+        - Name: "Source"
+          Actions:
+            - Name: "GetSource"
+              Namespace: "SourceVariables"
+              ActionTypeId:
+                Category: "Source"
+                Owner: "AWS"
+                Provider: "CodeStarSourceConnection"
+                Version: "1"
+              Configuration:
+                ConnectionArn: !GetAtt GitHubConnection.ConnectionArn
+                FullRepositoryId: !Sub "${GitHubUsername}/${GitHubRepositoryName}"
+                BranchName: !Ref GitHubBranchName
+                DetectChanges: true
+                OutputArtifactFormat: "CODE_ZIP"
+              OutputArtifacts:
+                - Name: "SourceCode"
+
+        # NEW: the pipeline pauses here and the maintainer is emailed.
+        # It resumes only after the change is approved.
+        - Name: "Review"
+          Actions:
+            - Name: "ManualApproval"
+              ActionTypeId:
+                Category: "Approval"
+                Owner: "AWS"
+                Provider: "Manual"
+                Version: "1"
+              Configuration:
+                NotificationArn: !Ref ApprovalTopic
+                CustomData: >-
+                  Commit #{SourceVariables.CommitId} on branch #{SourceVariables.BranchName}
+                  is waiting for review. Approve to build and deploy it, or reject to stop the release.
+                ExternalEntityLink: !Sub "https://github.com/${GitHubUsername}/${GitHubRepositoryName}/commit/#{SourceVariables.CommitId}"
+
+        - Name: "Build"
+          Actions:
+            - Name: "BuildSource"
+              InputArtifacts:
+                - Name: "SourceCode"
+              ActionTypeId:
+                Category: "Build"
+                Owner: "AWS"
+                Provider: "CodeBuild"
+                Version: "1"
+              Configuration:
+                ProjectName: !Ref AppBuildProject
+              OutputArtifacts:
+                - Name: "CodeArtifact"
+
+        - Name: "Deploy"
+          Actions:
+            - Name: "DeployArtifact"
+              InputArtifacts:
+                - Name: "CodeArtifact"
+              ActionTypeId:
+                Category: "Deploy"
+                Owner: "AWS"
+                Provider: "CodeDeploy"
+                Version: "1"
+              Configuration:
+                ApplicationName: !Ref WebPlatformApplication
+                DeploymentGroupName: !Ref WebPlatformDeploymentGroup
+
+  CodePipelineServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Action:
+              - "sts:AssumeRole"
+            Effect: "Allow"
+            Principal:
+              Service:
+                - "codepipeline.amazonaws.com"
+      Path: "/service-role/"
+      Policies:
+        - PolicyName: "pipeline-access"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: "Allow"
+                Action:
+                  - "codestar-connections:UseConnection"
+                  - "codeconnections:UseConnection"
+                Resource: !GetAtt GitHubConnection.ConnectionArn
+              - Effect: "Allow"
+                Resource:
+                  - !GetAtt ArtifactBucket.Arn
+                  - !Sub "${ArtifactBucket.Arn}/*"
+                Action:
+                  - "s3:PutObject"
+                  - "s3:PutObjectAcl"
+                  - "s3:GetObject"
+                  - "s3:GetObjectVersion"
+                  - "s3:GetBucketAcl"
+                  - "s3:GetBucketLocation"
+                  - "s3:GetBucketVersioning"
+              - Effect: "Allow"
+                Action:
+                  - "codebuild:BatchGetBuilds"
+                  - "codebuild:StartBuild"
+                Resource: !GetAtt AppBuildProject.Arn
+              - Effect: "Allow"
+                Action:
+                  - "codedeploy:CreateDeployment"
+                  - "codedeploy:GetApplication"
+                  - "codedeploy:GetApplicationRevision"
+                  - "codedeploy:GetDeployment"
+                  - "codedeploy:GetDeploymentConfig"
+                  - "codedeploy:RegisterApplicationRevision"
+                Resource: "*"
+              # NEW: lets the Review stage send the approval notification
+              - Effect: "Allow"
+                Action: "sns:Publish"
+                Resource: !Ref ApprovalTopic
+
+Outputs:
+  ELBEndpoint:
+    Description: "ELB DNS endpoint address"
+    Value: !GetAtt ELB.DNSName
+  PipelineName:
+    Value: !Ref AppCodePipeline
+  PipelineConsoleUrl:
+    Value: !Sub "https://${AWS::Region}.console.aws.amazon.com/codesuite/codepipeline/pipelines/${AppCodePipeline}/view?region=${AWS::Region}"
+  ConnectionArn:
+    Description: "Activate this connection once in the console before the pipeline can pull from GitHub"
+    Value: !GetAtt GitHubConnection.ConnectionArn
+  ApprovalTopicArn:
+    Value: !Ref ApprovalTopic
+  ArtifactBucketName:
+    Value: !Ref ArtifactBucket
+  BuildProjectName:
+    Value: !Ref AppBuildProject
+  CodeDeployApplication:
+    Value: !Ref WebPlatformApplication
+  CodeDeployDeploymentGroup:
+    Value: !Ref WebPlatformDeploymentGroup
